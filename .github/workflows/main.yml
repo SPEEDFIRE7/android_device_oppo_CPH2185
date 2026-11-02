@@ -58,6 +58,11 @@ on:
         required: true
         type: boolean
         default: true
+      fix_root_copy:
+        description: 'إصلاح تعارض نسخ ueventd.rc و init.rc إلى root (يُنقل ueventd.rc إلى vendor)'
+        required: true
+        type: boolean
+        default: true
       apk_mode:
         description: 'معالجة APK الموجودة في PRODUCT_COPY_FILES: strip=حذفها (للاختبار السريع) / prebuilt=تحويلها لوحدات BUILD_PREBUILT / none=بدون تعديل'
         required: true
@@ -88,6 +93,7 @@ jobs:
       OUT_ON_CACHE: ${{ github.event.inputs.out_on_cache }}
       CLEAN_OUT: ${{ github.event.inputs.clean_out }}
       FIX_INIT_RC: ${{ github.event.inputs.fix_init_rc }}
+      FIX_ROOT_COPY: ${{ github.event.inputs.fix_root_copy }}
       APK_MODE: ${{ github.event.inputs.apk_mode }}
     steps:
       - name: Runner info
@@ -253,6 +259,76 @@ jobs:
           PY
           echo "--- بعد التعديل ---"
           grep -rn "init\.rc" "$D" --include='*.mk' --include='*.bp' || echo "(لا يوجد)"
+
+      - name: Fix root copy-file conflicts (ueventd.rc / init.rc)
+        if: ${{ github.event.inputs.fix_root_copy == 'true' }}
+        working-directory: ${{ github.workspace }}/lineage
+        run: |
+          echo "--- كل ما يذكر ueventd.rc أو init.rc في ملفات mk قبل التعديل ---"
+          grep -rnE "(ueventd|init)\.rc" "vendor/oppo/${DEVICE}" "device/oppo/${DEVICE}" --include='*.mk' || echo "(لا يوجد)"
+          python3 - <<'PY3'
+          import os, re, pathlib
+          dev = os.environ["DEVICE"]
+          bases = [pathlib.Path("vendor/oppo/" + dev), pathlib.Path("device/oppo/" + dev)]
+          tok = re.compile(r'(\S+?):((?:\S*/)?(?:ueventd|init)\.rc)(?=[\s\\]|$)')
+
+          def is_root(dst):
+              return (dst.startswith("root/") or "TARGET_ROOT_OUT" in dst
+                      or "TARGET_COPY_OUT_ROOT" in dst)
+
+          def is_vendor(dst):
+              return ("TARGET_COPY_OUT_VENDOR" in dst or dst.startswith("vendor/")
+                      or "TARGET_COPY_OUT_ODM" in dst or dst.startswith("odm/"))
+
+          files = []
+          for b in bases:
+              if b.exists():
+                  files += sorted(b.rglob("*.mk"))
+
+          # هل يوجد ueventd.rc مخصص لـ vendor مسبقاً؟
+          vendor_ueventd = False
+          for f in files:
+              for m in tok.finditer(f.read_text()):
+                  if m.group(2).endswith("ueventd.rc") and is_vendor(m.group(2)):
+                      vendor_ueventd = True
+          print("يوجد ueventd.rc في vendor مسبقاً:", vendor_ueventd)
+
+          state = {"vendor_used": vendor_ueventd}
+
+          def repl(m):
+              src, dst = m.group(1), m.group(2)
+              if not is_root(dst):
+                  return m.group(0)
+              if dst.endswith("init.rc"):
+                  print(f"  حذف نسخ init.rc إلى root: {src}:{dst}")
+                  return ""
+              if state["vendor_used"]:
+                  print(f"  حذف نسخ ueventd.rc إلى root (يوجد بديل في vendor): {src}:{dst}")
+                  return ""
+              state["vendor_used"] = True
+              new = "$(TARGET_COPY_OUT_VENDOR)/ueventd.rc"
+              print(f"  نقل ueventd.rc من root إلى vendor: {src}:{dst} -> {src}:{new}")
+              return f"{src}:{new}"
+
+          for f in files:
+              text = f.read_text()
+              out, changed = [], False
+              for ln in text.split("\n"):
+                  if ln.lstrip().startswith("#") or not tok.search(ln):
+                      out.append(ln)
+                      continue
+                  new = tok.sub(repl, ln)
+                  if new != ln:
+                      changed = True
+                      if new.strip() in ("", "\\"):
+                          new = "\\" if ln.rstrip().endswith("\\") else ""
+                  out.append(new)
+              if changed:
+                  f.write_text("\n".join(out))
+                  print(f"عُدّل: {f}")
+          PY3
+          echo "--- بعد التعديل ---"
+          grep -rnE "(ueventd|init)\.rc" "vendor/oppo/${DEVICE}" "device/oppo/${DEVICE}" --include='*.mk' || echo "(لا يوجد)"
 
       - name: Fix prebuilt APKs in PRODUCT_COPY_FILES
         if: ${{ github.event.inputs.apk_mode != 'none' }}
