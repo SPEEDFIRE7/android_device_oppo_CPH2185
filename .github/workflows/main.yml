@@ -28,6 +28,8 @@ on:
         type: choice
         options:
           - bootimage
+          - vendorimage
+          - productimage
           - systemimage
           - bacon
       build_type:
@@ -63,6 +65,11 @@ on:
         required: true
         type: boolean
         default: true
+      preflight:
+        description: 'فحص مرحلة makefile وإصلاح الأخطاء المعروفة تلقائياً قبل البناء (بدون إعادة مزامنة)'
+        required: true
+        type: boolean
+        default: true
       apk_mode:
         description: 'معالجة APK الموجودة في PRODUCT_COPY_FILES: strip=حذفها (للاختبار السريع) / prebuilt=تحويلها لوحدات BUILD_PREBUILT / none=بدون تعديل'
         required: true
@@ -95,6 +102,7 @@ jobs:
       FIX_INIT_RC: ${{ github.event.inputs.fix_init_rc }}
       FIX_ROOT_COPY: ${{ github.event.inputs.fix_root_copy }}
       APK_MODE: ${{ github.event.inputs.apk_mode }}
+      PREFLIGHT: ${{ github.event.inputs.preflight }}
     steps:
       - name: Runner info
         run: |
@@ -416,6 +424,197 @@ jobs:
           PY2
           echo "--- أسطر .apk بعد التعديل ---"
           grep -rn "\.apk" "vendor/oppo/${DEVICE}" "device/oppo/${DEVICE}" --include='*.mk' | head -40 || echo "(لا يوجد)"
+
+      - name: Preflight (self-healing makefile check)
+        if: ${{ github.event.inputs.preflight == 'true' }}
+        working-directory: ${{ github.workspace }}/lineage
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/result"
+          cat > "$GITHUB_WORKSPACE/preflight.py" <<'PF'
+          import os, re, subprocess, pathlib
+
+          DEV = os.environ["DEVICE"]
+          BT = os.environ["BTYPE"]
+          WS = pathlib.Path(os.environ.get("GITHUB_WORKSPACE", "."))
+          LOGF = WS / "result" / "preflight.log"
+          LOGF.parent.mkdir(parents=True, exist_ok=True)
+          APK_MODE = os.environ.get("APK_MODE", "strip")
+
+
+          def log(*a):
+              s = " ".join(str(x) for x in a)
+              print(s, flush=True)
+              with open(LOGF, "a", encoding="utf-8") as fh:
+                  fh.write(s + "\n")
+
+
+          def sh(cmd, timeout=3000):
+              p = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=timeout)
+              return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+          ENVSETUP = ("export LC_ALL=C ALLOW_MISSING_DEPENDENCIES=true; "
+                      "source build/envsetup.sh >/dev/null 2>&1; "
+                      f"lunch lineage_{DEV}-{BT} >/dev/null 2>&1 || {{ echo LUNCH_FAILED; exit 7; }}; ")
+
+          PAIR = re.compile(r'^[\w./+@~-]+:[\w./+@~-]+$')
+          TOK = re.compile(r'(\S+?):((?:\S*/)?(?:ueventd|init)\.rc)(?=[\s\\]|$)')
+          APKTOK = re.compile(r'(\S+\.apk):(\S+\.apk)')
+
+
+          def copy_pairs():
+              rc, out = sh(ENVSETUP + "get_build_var PRODUCT_COPY_FILES")
+              pairs = [t.split(":", 1) for t in out.split() if PAIR.match(t)]
+              log(f"عدد أزواج PRODUCT_COPY_FILES: {len(pairs)}")
+              return pairs
+
+
+          def mk_files():
+              res = []
+              for top in ("device", "vendor", "hardware"):
+                  p = pathlib.Path(top)
+                  if p.exists():
+                      res += list(p.rglob("*.mk"))
+              return res
+
+
+          def clean_line(old, new):
+              if new.strip() in ("", "\\"):
+                  return "\\" if old.rstrip().endswith("\\") else ""
+              return new
+
+
+          def fix_root_copy():
+              pairs = copy_pairs()
+              interesting = [(s, d) for s, d in pairs if d.endswith("ueventd.rc") or d.endswith("/init.rc") or d == "init.rc"]
+              log("أزواج ueventd.rc / init.rc الحالية:")
+              for s, d in interesting:
+                  log(f"   {s} -> {d}")
+              offenders = [(s, d) for s, d in interesting if d in ("root/ueventd.rc", "root/init.rc")]
+              if not offenders:
+                  log("لا توجد أزواج نسخ إلى root/ueventd.rc أو root/init.rc، التعارض ليس من PRODUCT_COPY_FILES")
+                  return False
+              vendor_ueventd = any(d in ("vendor/ueventd.rc", "odm/ueventd.rc") for s, d in pairs)
+              state = {"vendor_used": vendor_ueventd, "changed": 0}
+              off_srcs = {s for s, d in offenders}
+
+              def matches(src_tok, f):
+                  exp = src_tok.replace("$(LOCAL_PATH)", str(f.parent))
+                  if exp in off_srcs:
+                      return True
+                  if "$(" in src_tok:
+                      suffix = src_tok.rsplit(")", 1)[-1]
+                      return bool(suffix) and any(s.endswith(suffix) for s in off_srcs)
+                  return any(s == src_tok for s in off_srcs)
+
+              for f in mk_files():
+                  try:
+                      text = f.read_text(errors="ignore")
+                  except Exception:
+                      continue
+                  if "ueventd.rc" not in text and "init.rc" not in text:
+                      continue
+                  out, changed = [], False
+                  for ln in text.split("\n"):
+                      if ln.lstrip().startswith("#") or not TOK.search(ln):
+                          out.append(ln)
+                          continue
+
+                      def repl(m):
+                          src, dst = m.group(1), m.group(2)
+                          if re.search(r'VENDOR|ODM|^vendor/|^odm/|^system/|TARGET_COPY_OUT_SYSTEM', dst):
+                              return m.group(0)
+                          if not matches(src, f):
+                              return m.group(0)
+                          if dst.endswith("init.rc"):
+                              log(f"  حذف {src}:{dst}   ({f})")
+                              return ""
+                          if state["vendor_used"]:
+                              log(f"  حذف {src}:{dst}   ({f})")
+                              return ""
+                          state["vendor_used"] = True
+                          log(f"  نقل إلى vendor: {src}:{dst}   ({f})")
+                          return f"{src}:$(TARGET_COPY_OUT_VENDOR)/ueventd.rc"
+
+                      new = TOK.sub(repl, ln)
+                      if new != ln:
+                          changed = True
+                          new = clean_line(ln, new)
+                      out.append(new)
+                  if changed:
+                      f.write_text("\n".join(out))
+                      state["changed"] += 1
+              log(f"عدد الملفات المعدّلة: {state['changed']}")
+              if state["changed"] == 0:
+                  log("لم أجد في ملفات mk سطراً يطابق الأزواج المتعارضة. مواقع محتملة (grep):")
+                  rc, out = sh("grep -rn 'ueventd.rc' device vendor hardware --include='*.mk' --include='*.bp' 2>/dev/null | head -40")
+                  log(out)
+              return state["changed"] > 0
+
+
+          def fix_apks():
+              if APK_MODE == "prebuilt":
+                  log("apk_mode=prebuilt: تُعالج في خطوة APK السابقة، لا تعديل هنا")
+                  return False
+              n = 0
+              for top in ("vendor/oppo/" + DEV, "device/oppo/" + DEV):
+                  base = pathlib.Path(top)
+                  if not base.exists():
+                      continue
+                  for f in base.rglob("*.mk"):
+                      text = f.read_text(errors="ignore")
+                      if ".apk" not in text:
+                          continue
+                      out, changed = [], False
+                      for ln in text.split("\n"):
+                          if APKTOK.search(ln) and not ln.lstrip().startswith("#"):
+                              new = clean_line(ln, APKTOK.sub("", ln))
+                              changed = True
+                              out.append(new)
+                          else:
+                              out.append(ln)
+                      if changed:
+                          f.write_text("\n".join(out))
+                          n += 1
+                          log(f"  أُزيلت مدخلات APK من {f}")
+              return n > 0
+
+
+          def run_nothing():
+              return sh(ENVSETUP + "m nothing 2>&1")
+
+
+          log("=== Preflight: فحص مرحلة makefile وإصلاح الأخطاء المعروفة تلقائياً ===")
+          log(f"fix_init_rc={os.environ.get('FIX_INIT_RC')} fix_root_copy={os.environ.get('FIX_ROOT_COPY')} apk_mode={APK_MODE}")
+          ok = False
+          for i in range(1, 7):
+              log(f"--- المحاولة {i}: تشغيل m nothing ---")
+              rc, out = run_nothing()
+              (WS / "result" / f"preflight-run{i}.log").write_text("\n".join(out.splitlines()[-200:]))
+              if "LUNCH_FAILED" in out:
+                  log("فشل lunch، راجع preflight-run*.log")
+                  break
+              if rc == 0:
+                  log("نجحت مرحلة makefile بلا أخطاء")
+                  ok = True
+                  break
+              errs = [l for l in out.splitlines() if "error:" in l or "Error:" in l]
+              for e in errs[:6]:
+                  log("خطأ:", e)
+              fixed = False
+              if re.search(r"overriding commands for target .*/root/(ueventd|init)\.rc", out):
+                  fixed = fix_root_copy()
+              elif "Prebuilt apk found in PRODUCT_COPY_FILES" in out:
+                  fixed = fix_apks()
+              else:
+                  log("لا يوجد إصلاح تلقائي لهذا الخطأ. آخر أسطر الإخراج:")
+                  log("\n".join(out.splitlines()[-25:]))
+              if not fixed:
+                  log("لم يُطبَّق أي تعديل، أتوقف هنا")
+                  break
+          log("نتيجة preflight:", "نجح" if ok else "لم ينجح بالكامل")
+          PF
+          python3 "$GITHUB_WORKSPACE/preflight.py" || true
 
       - name: Build
         working-directory: ${{ github.workspace }}/lineage
