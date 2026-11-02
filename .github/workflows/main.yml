@@ -1,0 +1,432 @@
+name: Build LineageOS 17.1 (Oppo A15 CPH2185) - Namespace
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_repo:
+        description: 'مستودع device tree (user/repo أو رابط كامل)'
+        required: true
+      device_branch:
+        description: 'فرع device tree'
+        required: true
+        default: 'lineage-17.1'
+      vendor_repo:
+        description: 'مستودع vendor (نفس المستودع إن كانا معاً)'
+        required: true
+      vendor_branch:
+        description: 'فرع vendor'
+        required: true
+        default: 'vendor-lineage-17.1'
+      device_name:
+        description: 'اسم الجهاز (codename)'
+        required: true
+        default: 'CPH2185'
+      target:
+        description: 'الهدف'
+        required: true
+        default: 'bootimage'
+        type: choice
+        options:
+          - bootimage
+          - systemimage
+          - bacon
+      build_type:
+        description: 'نوع البناء'
+        required: true
+        default: 'userdebug'
+        type: choice
+        options:
+          - userdebug
+          - eng
+          - user
+      build_timeout_min:
+        description: 'مهلة البناء بالدقائق'
+        required: true
+        default: '600'
+      out_on_cache:
+        description: 'وضع ccache ومجلد out على قرص /cache الدائم'
+        required: true
+        type: boolean
+        default: true
+      clean_out:
+        description: 'حذف مجلد out القديم قبل البناء'
+        required: true
+        type: boolean
+        default: false
+      fix_init_rc:
+        description: 'حذف تعريف init.rc المتعارض من device tree'
+        required: true
+        type: boolean
+        default: true
+      apk_mode:
+        description: 'معالجة APK الموجودة في PRODUCT_COPY_FILES: strip=حذفها (للاختبار السريع) / prebuilt=تحويلها لوحدات BUILD_PREBUILT / none=بدون تعديل'
+        required: true
+        default: 'strip'
+        type: choice
+        options:
+          - strip
+          - prebuilt
+          - none
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: namespace-profile-bombardino
+    timeout-minutes: 720
+    env:
+      TOKEN: ${{ secrets.GH_PAT || github.token }}
+      IN_DEVICE_REPO: ${{ github.event.inputs.device_repo }}
+      IN_DEVICE_BRANCH: ${{ github.event.inputs.device_branch }}
+      IN_VENDOR_REPO: ${{ github.event.inputs.vendor_repo }}
+      IN_VENDOR_BRANCH: ${{ github.event.inputs.vendor_branch }}
+      DEVICE: ${{ github.event.inputs.device_name }}
+      TARGET: ${{ github.event.inputs.target }}
+      BTYPE: ${{ github.event.inputs.build_type }}
+      BUILD_TIMEOUT_MIN: ${{ github.event.inputs.build_timeout_min }}
+      OUT_ON_CACHE: ${{ github.event.inputs.out_on_cache }}
+      CLEAN_OUT: ${{ github.event.inputs.clean_out }}
+      FIX_INIT_RC: ${{ github.event.inputs.fix_init_rc }}
+      APK_MODE: ${{ github.event.inputs.apk_mode }}
+    steps:
+      - name: Runner info
+        run: |
+          cat /etc/os-release | head -2
+          echo "الأنوية: $(nproc --all)"
+          free -h
+          df -h / /cache 2>/dev/null || df -h "$GITHUB_WORKSPACE"
+
+      - name: Prepare cache dirs
+        run: |
+          if [ "$OUT_ON_CACHE" = "true" ] && [ -d /cache ]; then
+            sudo mkdir -p /cache/ccache /cache/out
+            sudo chown -R "$(id -u):$(id -g)" /cache/ccache /cache/out
+            if [ "$CLEAN_OUT" = "true" ]; then rm -rf /cache/out/* ; fi
+            echo "CCACHE_DIR=/cache/ccache" >> "$GITHUB_ENV"
+            echo "OUT_BASE=/cache/out" >> "$GITHUB_ENV"
+            echo "OUT_DIR=/cache/out" >> "$GITHUB_ENV"
+            echo "سيُستخدم /cache لـ ccache و out"
+          else
+            mkdir -p "$GITHUB_WORKSPACE/.ccache"
+            echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache" >> "$GITHUB_ENV"
+            echo "OUT_BASE=$GITHUB_WORKSPACE/lineage/out" >> "$GITHUB_ENV"
+            echo "سيُستخدم قرص الجذر لـ ccache و out"
+          fi
+
+      - name: Normalize repos
+        run: |
+          norm() { T="$1"; T="${T#https://github.com/}"; T="${T#http://github.com/}"; T="${T%.git}"; T="${T%/}"; echo "$T"; }
+          echo "DEVICE_REPO=$(norm "$IN_DEVICE_REPO")" >> "$GITHUB_ENV"
+          echo "VENDOR_REPO=$(norm "$IN_VENDOR_REPO")" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          PKGS="bc bison build-essential ccache curl flex g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev lib32z1-dev libelf-dev liblz4-tool libncurses-dev libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3 unzip"
+          AVAIL=""
+          for p in $PKGS; do
+            if apt-cache policy "$p" 2>/dev/null | grep -q 'Candidate: [^(]'; then
+              AVAIL="$AVAIL $p"
+            else
+              echo "غير متوفرة (تخطي): $p"
+            fi
+          done
+          sudo apt-get install -y $AVAIL
+
+          # libncurses5 و libtinfo5 غير موجودتين في Ubuntu 24.04، نجلبهما من 22.04
+          if ! dpkg -s libtinfo5 >/dev/null 2>&1; then
+            echo "deb [arch=amd64] http://azure.archive.ubuntu.com/ubuntu jammy main universe" | sudo tee /etc/apt/sources.list.d/jammy-tmp.list >/dev/null
+            sudo apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/jammy-tmp.list -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup=0 || true
+            (cd /tmp && apt-get download libtinfo5 libncurses5) || echo "تعذر تنزيل libncurses5"
+            sudo dpkg -i /tmp/libtinfo5_*.deb /tmp/libncurses5_*.deb || echo "تعذر تثبيت libncurses5"
+            sudo rm -f /etc/apt/sources.list.d/jammy-tmp.list
+            sudo apt-get update || true
+          fi
+          dpkg -s libncurses5 libtinfo5 2>/dev/null | grep -E '^(Package|Status)' || true
+
+          mkdir -p ~/bin
+          curl -sL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          git config --global user.name "builder"
+          git config --global user.email "builder@users.noreply.github.com"
+          git config --global color.ui false
+          git config --global gc.auto 0
+
+      - name: Check device and vendor repos
+        run: |
+          git ls-remote --exit-code --heads "https://x-access-token:${TOKEN}@github.com/${DEVICE_REPO}.git" "$IN_DEVICE_BRANCH" >/dev/null \
+            || { echo "::error::مستودع أو فرع device غير موجود: ${DEVICE_REPO} @ ${IN_DEVICE_BRANCH}"; exit 1; }
+          git ls-remote --exit-code --heads "https://x-access-token:${TOKEN}@github.com/${VENDOR_REPO}.git" "$IN_VENDOR_BRANCH" >/dev/null \
+            || { echo "::error::مستودع أو فرع vendor غير موجود: ${VENDOR_REPO} @ ${IN_VENDOR_BRANCH}"; exit 1; }
+          echo "المستودعات سليمة"
+
+      - name: Sync LineageOS 17.1 source
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p lineage && cd lineage
+          ~/bin/repo init -u https://github.com/LineageOS/android.git -b lineage-17.1 \
+            -g default,-darwin --depth=1 --no-clone-bundle
+          ( while true; do
+              echo "[monitor] $(date +%H:%M) disk: $(df -h . | tail -1 | awk '{print $3" used, "$4" free"}') | mem: $(free -m | awk '/Mem:/{print $3"MB used, "$7"MB avail"}')"
+              sleep 180
+            done ) &
+          MON=$!
+          ok=0
+          for i in 1 2 3 4; do
+            if ~/bin/repo sync -c -j4 -q --force-sync --no-clone-bundle --no-tags --optimized-fetch; then ok=1; break; fi
+            echo "إعادة محاولة المزامنة ($i)"; sleep 15
+          done
+          kill $MON 2>/dev/null || true
+          [ "$ok" = "1" ] || { echo "::error::فشلت مزامنة المصدر"; exit 1; }
+          df -h .
+
+      - name: Add device and vendor trees
+        working-directory: ${{ github.workspace }}/lineage
+        run: |
+          mkdir -p device/oppo vendor/oppo
+          git clone --depth=1 -b "$IN_DEVICE_BRANCH" \
+            "https://x-access-token:${TOKEN}@github.com/${DEVICE_REPO}.git" "device/oppo/${DEVICE}"
+          git clone --depth=1 -b "$IN_VENDOR_BRANCH" \
+            "https://x-access-token:${TOKEN}@github.com/${VENDOR_REPO}.git" "vendor/oppo/${DEVICE}"
+          rm -rf "device/oppo/${DEVICE}/.git" "vendor/oppo/${DEVICE}/.git"
+          ls -la "device/oppo/${DEVICE}" | head -60
+          ls "vendor/oppo/${DEVICE}" | head -40
+          if [ ! -f "device/oppo/${DEVICE}/lineage_${DEVICE}.mk" ]; then
+            echo "::warning::لم أجد lineage_${DEVICE}.mk في device tree، قد يفشل lunch"
+          fi
+
+      - name: Patch BoardConfig for dynamic partitions
+        working-directory: ${{ github.workspace }}/lineage
+        run: |
+          grep -rl "BOARD_BUILD_SYSTEM_ROOT_IMAGE" "device/oppo/${DEVICE}" | while read -r f; do
+            sed -i -E 's/^([[:space:]]*BOARD_BUILD_SYSTEM_ROOT_IMAGE[[:space:]]*:?=).*/\1 false/' "$f"
+          done
+          grep -rn "BOARD_BUILD_SYSTEM_ROOT_IMAGE" "device/oppo/${DEVICE}" || echo "(لا يوجد)"
+
+      - name: Fix init.rc conflict
+        if: ${{ github.event.inputs.fix_init_rc == 'true' }}
+        working-directory: ${{ github.workspace }}/lineage
+        run: |
+          D="device/oppo/${DEVICE}"
+          echo "--- كل ما يذكر init.rc قبل التعديل ---"
+          grep -rn "init\.rc" "$D" --include='*.mk' --include='*.bp' || echo "(لا يوجد)"
+          echo "--- محتويات rootdir ---"
+          ls -la "$D/rootdir" 2>/dev/null || echo "(لا يوجد مجلد rootdir)"
+          ls -la "$D/rootdir/etc" 2>/dev/null || true
+          python3 - <<'PY'
+          import os, re, pathlib
+          root = pathlib.Path("device/oppo/" + os.environ["DEVICE"])
+
+          # 1) حذف كتل Android.mk التي تعرّف LOCAL_MODULE := init.rc
+          pat = re.compile(
+              r'include \$\(CLEAR_VARS\)(?:(?!include \$\(CLEAR_VARS\)).)*?'
+              r'LOCAL_MODULE\s*:?=\s*init\.rc[ \t]*\n'
+              r'(?:(?!include \$\(CLEAR_VARS\)).)*?'
+              r'include \$\(BUILD_[A-Z_]+\)[ \t]*\n?',
+              re.S)
+          for f in root.rglob("Android.mk"):
+              t = f.read_text()
+              n, c = pat.subn("", t)
+              if c:
+                  f.write_text(n)
+                  print(f"حُذفت {c} كتلة init.rc من {f}")
+
+          # 2) إزالة init.rc من PRODUCT_PACKAGES في ملفات .mk
+          for f in root.rglob("*.mk"):
+              lines = f.read_text().split("\n")
+              out, changed = [], False
+              for ln in lines:
+                  if re.match(r'^\s*init\.rc\s*\\?\s*$', ln):
+                      out.append("\\" if ln.rstrip().endswith("\\") else "")
+                      changed = True
+                  else:
+                      out.append(ln)
+              if changed:
+                  f.write_text("\n".join(out))
+                  print(f"أُزيل init.rc من {f}")
+
+          # 3) تنبيه إن كان التعريف في Android.bp
+          for f in root.rglob("Android.bp"):
+              if re.search(r'name:\s*"init\.rc"', f.read_text()):
+                  print(f"::warning::وحدة init.rc معرّفة في {f} (Android.bp)، احذفها يدوياً من المستودع")
+          PY
+          echo "--- بعد التعديل ---"
+          grep -rn "init\.rc" "$D" --include='*.mk' --include='*.bp' || echo "(لا يوجد)"
+
+      - name: Fix prebuilt APKs in PRODUCT_COPY_FILES
+        if: ${{ github.event.inputs.apk_mode != 'none' }}
+        working-directory: ${{ github.workspace }}/lineage
+        run: |
+          echo "الوضع: $APK_MODE"
+          echo "--- أسطر .apk في ملفات mk قبل التعديل ---"
+          grep -rn "\.apk" "vendor/oppo/${DEVICE}" "device/oppo/${DEVICE}" --include='*.mk' | head -60 || true
+          python3 - <<'PY2'
+          import os, re, pathlib
+          dev = os.environ["DEVICE"]
+          mode = os.environ.get("APK_MODE", "strip")
+          vroot = pathlib.Path("vendor/oppo/" + dev)
+          droot = pathlib.Path("device/oppo/" + dev)
+          tok = re.compile(r'(\S+\.apk):(\S+\.apk)')
+
+          found = []  # (ملف mk، المصدر، الوجهة)
+          for base in (vroot, droot):
+              if not base.exists():
+                  continue
+              for f in sorted(base.rglob("*.mk")):
+                  text = f.read_text()
+                  if ".apk" not in text:
+                      continue
+                  out, changed = [], False
+                  for ln in text.split("\n"):
+                      if tok.search(ln) and not ln.lstrip().startswith("#"):
+                          for m in tok.finditer(ln):
+                              found.append((f, m.group(1), m.group(2)))
+                          new = tok.sub("", ln)
+                          if new.strip() in ("", "\\"):
+                              new = "\\" if ln.rstrip().endswith("\\") else ""
+                          out.append(new)
+                          changed = True
+                      else:
+                          out.append(ln)
+                  if changed:
+                      f.write_text("\n".join(out))
+                      print(f"أُزيلت مدخلات APK من PRODUCT_COPY_FILES في {f}")
+
+          print(f"عدد ملفات APK التي أُزيلت من PRODUCT_COPY_FILES: {len(found)}")
+          for f, s, d in found:
+              print("  -", s, "->", d)
+
+          if mode == "prebuilt" and found:
+              seen, blocks, per_mk = set(), [], {}
+              for f, src, dst in found:
+                  name = pathlib.Path(dst).stem
+                  if name in seen:
+                      continue
+                  seen.add(name)
+                  s = src.replace("$(LOCAL_PATH)", str(f.parent))
+                  if not pathlib.Path(s).exists():
+                      print(f"::warning::ملف APK غير موجود: {s}")
+                  rel = os.path.relpath(s, str(vroot))
+                  lines = [
+                      "include $(CLEAR_VARS)",
+                      f"LOCAL_PATH := {vroot}",
+                      f"LOCAL_MODULE := {name}",
+                      "LOCAL_MODULE_TAGS := optional",
+                      "LOCAL_MODULE_CLASS := APPS",
+                      "LOCAL_MODULE_SUFFIX := .apk",
+                      f"LOCAL_SRC_FILES := {rel}",
+                      "LOCAL_CERTIFICATE := PRESIGNED",
+                      "LOCAL_DEX_PREOPT := false",
+                  ]
+                  if "TARGET_COPY_OUT_VENDOR" in dst or dst.startswith("vendor/"):
+                      lines.append("LOCAL_VENDOR_MODULE := true")
+                  elif "TARGET_COPY_OUT_PRODUCT" in dst or dst.startswith("product/"):
+                      lines.append("LOCAL_PRODUCT_MODULE := true")
+                  if "priv-app" in dst:
+                      lines.append("LOCAL_PRIVILEGED_MODULE := true")
+                  lines.append("include $(BUILD_PREBUILT)")
+                  blocks.append("\n".join(lines))
+                  per_mk.setdefault(f, []).append(name)
+
+              amk = vroot / "Android.mk"
+              old = amk.read_text() if amk.exists() else "LOCAL_PATH := $(call my-dir)\n"
+              amk.write_text(old.rstrip("\n") + "\n\n# --- prebuilt APKs (مولّد تلقائياً) ---\n" + "\n\n".join(blocks) + "\n")
+              print(f"أُضيفت {len(blocks)} وحدة BUILD_PREBUILT إلى {amk}")
+              for f, names in per_mk.items():
+                  with open(f, "a") as fh:
+                      fh.write("\n\nPRODUCT_PACKAGES += " + " ".join(names) + "\n")
+                  print(f"أُضيفت {len(names)} وحدة إلى PRODUCT_PACKAGES في {f}")
+          PY2
+          echo "--- أسطر .apk بعد التعديل ---"
+          grep -rn "\.apk" "vendor/oppo/${DEVICE}" "device/oppo/${DEVICE}" --include='*.mk' | head -40 || echo "(لا يوجد)"
+
+      - name: Build
+        working-directory: ${{ github.workspace }}/lineage
+        run: |
+          export LC_ALL=C
+          export USE_CCACHE=1
+          export CCACHE_EXEC=$(which ccache)
+          export ALLOW_MISSING_DEPENDENCIES=true
+          mkdir -p "$CCACHE_DIR"
+          ccache -M 10G
+          export PATH=$HOME/bin:$PATH
+
+          # عدد المهام: لا يتجاوز الأنوية، وبحسب الذاكرة (أقل إن لم يوجد swap)
+          CORES=$(nproc --all)
+          MEM_GB=$(free -g | awk '/Mem:/{print $2}')
+          SWAP_MB=$(free -m | awk '/Swap:/{print $2}')
+          if [ "${SWAP_MB:-0}" -lt 2000 ]; then
+            JOBS=$(( (MEM_GB - 3) / 2 ))
+          else
+            JOBS=$(( MEM_GB / 2 ))
+          fi
+          [ "$JOBS" -gt "$CORES" ] && JOBS=$CORES
+          [ "$JOBS" -lt 2 ] && JOBS=2
+          export JOBS
+          echo "الأنوية=$CORES الذاكرة=${MEM_GB}GB swap=${SWAP_MB}MB عدد المهام JOBS=$JOBS"
+          echo "OUT_DIR=${OUT_DIR:-افتراضي}"
+
+          cat > "${GITHUB_WORKSPACE}/do_build.sh" <<'EOS'
+          set -o pipefail
+          source build/envsetup.sh
+          lunch "lineage_${DEVICE}-${BTYPE}" || exit 1
+          if [ "${TARGET}" = "bacon" ]; then
+            mka bacon -j"${JOBS}"
+          else
+            mka "${TARGET}" -j"${JOBS}"
+          fi
+          EOS
+
+          # مراقبة الموارد كل 3 دقائق
+          ( while true; do
+              echo "[monitor] $(date +%H:%M) disk: $(df -h . | tail -1 | awk '{print $4" free"}') | mem: $(free -m | awk '/Mem:/{print $3"MB used, "$7"MB avail"}')"
+              ps -eo pid,pcpu,pmem,comm --sort=-pmem | head -4
+              sleep 180
+            done ) &
+          MON=$!
+
+          set +e
+          timeout "${BUILD_TIMEOUT_MIN}m" bash "${GITHUB_WORKSPACE}/do_build.sh" 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+          RC=${PIPESTATUS[0]}
+          kill $MON 2>/dev/null || true
+          echo "BUILD_RC=$RC" >> "$GITHUB_ENV"
+          echo "انتهى البناء بالرمز: $RC (124 = انتهى الوقت، أعد التشغيل لمتابعة البناء من ccache)"
+          ccache -s | head -15
+          exit 0
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          df -h || true
+          free -h || true
+          sudo dmesg | tail -n 40 || true
+
+      - name: Collect output
+        if: always()
+        run: |
+          OUT="${OUT_BASE}/target/product/${DEVICE}"
+          mkdir -p "${GITHUB_WORKSPACE}/result"
+          if [ -d "$OUT" ]; then
+            for f in boot.img recovery.img dtbo.img vbmeta.img system.img vendor.img product.img lineage-*.zip lineage-*.zip.sha256sum; do
+              cp -v "$OUT"/$f "${GITHUB_WORKSPACE}/result/" 2>/dev/null || true
+            done
+          fi
+          cp -v "${OUT_BASE}/error.log" "${GITHUB_WORKSPACE}/result/" 2>/dev/null || true
+          tail -n 3000 "${GITHUB_WORKSPACE}/build.log" > "${GITHUB_WORKSPACE}/result/build-tail.log" 2>/dev/null || true
+          ls -lh "${GITHUB_WORKSPACE}/result"
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineage-17.1-${{ github.event.inputs.device_name }}-${{ github.event.inputs.target }}
+          path: ${{ github.workspace }}/result
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Fail if build failed
+        if: env.BUILD_RC != '0'
+        run: |
+          echo "::error::فشل البناء أو انتهى الوقت (الرمز $BUILD_RC). راجع build-tail.log و error.log في الـ artifact."
+          exit 1
