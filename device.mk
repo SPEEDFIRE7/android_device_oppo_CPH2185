@@ -30,7 +30,6 @@ PRODUCT_USE_DYNAMIC_PARTITIONS := true
 PRODUCT_CHARACTERISTICS := default
 
 # Rootdir
-# init.rc, ueventd.rc and ueventd.reserve.rc are provided by AOSP system/core/rootdir
 PRODUCT_PACKAGES += \
     engineer_vendor_shell.sh \
     init.oppo.face.sh \
