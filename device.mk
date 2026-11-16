@@ -30,6 +30,7 @@ PRODUCT_USE_DYNAMIC_PARTITIONS := true
 PRODUCT_CHARACTERISTICS := default
 
 # Rootdir
+# init.rc, ueventd.rc and ueventd.reserve.rc are provided by AOSP system/core/rootdir
 PRODUCT_PACKAGES += \
     engineer_vendor_shell.sh \
     init.oppo.face.sh \
@@ -58,11 +59,7 @@ PRODUCT_PACKAGES += \
     meta_init.project.rc \
     meta_init.rc \
     multi_init.rc \
-    init.aging.rc \
-    init.rc \
     init.recovery.mt6765.rc \
-    ueventd.rc \
-    ueventd.reserve.rc \
 
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/rootdir/etc/fstab.enableswap:$(TARGET_COPY_OUT_RAMDISK)/fstab.enableswap
