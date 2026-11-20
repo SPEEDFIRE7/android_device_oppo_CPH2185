@@ -49,7 +49,7 @@ jobs:
 
     env:
       WORK: ${{ github.workspace }}/lineage
-      OUT_DIR: ${{ github.workspace }}/out-artifacts
+      ARTIFACT_DIR: ${{ github.workspace }}/rom-artifacts
       CCACHE_DIR: ${{ github.workspace }}/.ccache
 
     steps:
@@ -112,6 +112,19 @@ jobs:
           cd "$WORK"
           repo sync -c -j8 --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
 
+      - name: Remove vendor blobs that conflict with AOSP modules
+        run: |
+          cd "$WORK"
+          VMK=vendor/oppo/CPH2185/CPH2185-vendor.mk
+          test -f "$VMK" || { echo "$VMK missing"; exit 1; }
+          echo "Before:"; grep -n "vendor/bin/dumpsys" "$VMK" || true
+          # dumpsys is built from source in Android 10, the copied blob causes "overriding commands"
+          sed -i -E 's#[^[:space:]]*/vendor/bin/dumpsys:[^[:space:]]*##g' "$VMK"
+          echo "After:"; grep -n "vendor/bin/dumpsys" "$VMK" || echo "dumpsys entry removed"
+          if grep -q "vendor/bin/dumpsys:" "$VMK"; then
+            echo "dumpsys copy rule still present"; exit 1
+          fi
+
       - name: Verify trees
         run: |
           cd "$WORK"
@@ -141,19 +154,19 @@ jobs:
       - name: Collect output
         run: |
           cd "$WORK"
-          mkdir -p "$OUT_DIR"
+          mkdir -p "$ARTIFACT_DIR"
           ZIP=$(ls out/target/product/CPH2185/lineage-17.1-*-UNOFFICIAL-CPH2185.zip 2>/dev/null | head -n1)
           test -n "$ZIP" || { echo "ROM zip not produced"; exit 1; }
-          cp "$ZIP" "$OUT_DIR/"
-          cp out/target/product/CPH2185/boot.img "$OUT_DIR/" 2>/dev/null || true
-          cp out/target/product/CPH2185/recovery.img "$OUT_DIR/" 2>/dev/null || true
-          cd "$OUT_DIR" && sha256sum * > SHA256SUMS
+          cp "$ZIP" "$ARTIFACT_DIR/"
+          cp out/target/product/CPH2185/boot.img "$ARTIFACT_DIR/" 2>/dev/null || true
+          cp out/target/product/CPH2185/recovery.img "$ARTIFACT_DIR/" 2>/dev/null || true
+          cd "$ARTIFACT_DIR" && sha256sum * > SHA256SUMS
 
       - name: Upload ROM artifact
         uses: actions/upload-artifact@v4
         with:
           name: lineage-17.1-cph2185
-          path: ${{ env.OUT_DIR }}
+          path: ${{ env.ARTIFACT_DIR }}
           retention-days: 7
 
       - name: Collect logs on failure
